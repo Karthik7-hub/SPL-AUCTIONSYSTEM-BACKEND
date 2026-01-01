@@ -5,32 +5,34 @@ const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
 
+// Import Models
 const Team = require('./models/Team');
 const Player = require('./models/Player');
 
 const app = express();
 const server = http.createServer(app);
 
+// --- MIDDLEWARE ---
 app.use(cors());
 app.use(express.json());
 
 // --- SOCKET.IO SETUP ---
 const io = new Server(server, {
     cors: {
-        origin: "*",
+        origin: "*", // Allow connections from any frontend (React/Mobile)
         methods: ["GET", "POST"]
     },
-    transports: ['websocket', 'polling'] // Prioritize WebSocket
+    transports: ['websocket', 'polling'] // Prioritize WebSocket for speed
 });
 
 // --- DATABASE CONNECTION ---
-// Added connection options for better reliability
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("✅ MongoDB Connected"))
     .catch(err => console.error("❌ DB Error:", err));
 
 // --- REAL-TIME STATE (IN-MEMORY) ---
-// This acts as a high-speed cache for the live auction
+// Bidding happens here in RAM for zero latency.
+// DB is only updated when a player is officially SOLD.
 let auctionState = {
     currentBid: 0,
     leadingTeamId: null,
@@ -40,10 +42,10 @@ let auctionState = {
 
 // --- API ROUTES ---
 
-// Initialize Data - OPTIMIZED WITH .lean()
+// 1. Initialize Data (Optimized with .lean())
 app.get('/api/init', async (req, res) => {
     try {
-        // .lean() makes queries much faster by returning plain JSON objects instead of Mongoose Docs
+        // .lean() converts heavy Mongoose docs to simple JSON objects (Faster)
         const teams = await Team.find().populate('players').lean();
         const players = await Player.find().sort('order').lean();
         res.json({ teams, players });
@@ -53,7 +55,7 @@ app.get('/api/init', async (req, res) => {
     }
 });
 
-// Add Team
+// 2. Add Team
 app.post('/api/teams', async (req, res) => {
     try {
         const team = new Team(req.body);
@@ -65,7 +67,7 @@ app.post('/api/teams', async (req, res) => {
     }
 });
 
-// Add Player
+// 3. Add Player
 app.post('/api/players', async (req, res) => {
     try {
         const count = await Player.countDocuments();
@@ -78,11 +80,11 @@ app.post('/api/players', async (req, res) => {
     }
 });
 
-// Delete Team
+// 4. Delete Team
 app.delete('/api/teams/:id', async (req, res) => {
     try {
         await Team.findByIdAndDelete(req.params.id);
-        // Reset players bought by this team
+        // Reset players bought by this team so they aren't "ghost sold"
         await Player.updateMany({ soldTo: req.params.id }, { isSold: false, soldTo: null, soldPrice: 0 });
         io.emit('data_update');
         res.json({ message: "Team deleted" });
@@ -91,68 +93,77 @@ app.delete('/api/teams/:id', async (req, res) => {
     }
 });
 
-// Delete Player
+// 5. Delete Player
 app.delete('/api/players/:id', async (req, res) => {
     try {
         const player = await Player.findById(req.params.id);
         if (!player) return res.status(404).json({ message: "Player not found" });
 
-        // Refund budget if player was sold
+        // If player was sold, refund budget to the team
         if (player.isSold && player.soldTo) {
             await Team.findByIdAndUpdate(player.soldTo, {
-                $pull: { players: player._id }, // Optimized pull
-                $inc: { spent: -player.soldPrice } // Optimized decrement
+                $pull: { players: player._id }, // Remove player ID from team array
+                $inc: { spent: -player.soldPrice } // Refund money
             });
         }
 
         await Player.findByIdAndDelete(req.params.id);
-        io.emit('data_update'); // Ensure frontend syncs
+        io.emit('data_update');
         res.json({ message: "Player deleted" });
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
 });
 
-// --- SOCKET.IO LOGIC (HIGH PERFORMANCE) ---
+// --- SOCKET.IO HANDLERS (THE BRAIN) ---
 io.on('connection', (socket) => {
-    // Send current state immediately on connection
+    // Send current state immediately upon connection (Syncs new users)
     socket.emit('auction_state', auctionState);
 
-    // 1. START ROUND
+    // A. START ROUND
     socket.on('start_player', ({ playerId, basePrice }) => {
-        // Update RAM only - No DB hit yet
         auctionState = {
-            currentBid: basePrice,
-            leadingTeamId: null,
+            currentBid: basePrice, // Set starting price
+            leadingTeamId: null,   // No leader yet
             currentPlayerId: playerId,
             status: 'ACTIVE'
         };
-        // Broadcast immediately (Sub-10ms latency)
+        // Broadcast immediately (0 database latency)
         io.emit('auction_state', auctionState);
     });
 
-    // 2. PLACE BID
+    // B. PLACE BID (Fixed Logic)
     socket.on('place_bid', ({ teamId, amount }) => {
-        // Validation in RAM is instant
-        if (amount <= auctionState.currentBid) return;
+        
+        // FIX: Allow opening bid if it EQUALS the base price
+        if (auctionState.leadingTeamId === null) {
+            // Opening bid validation
+            if (amount < auctionState.currentBid) return; 
+        } else {
+            // Subsequent bid validation (Must be higher)
+            if (amount <= auctionState.currentBid) return; 
+        }
 
+        // Update RAM State
         auctionState.currentBid = amount;
         auctionState.leadingTeamId = teamId;
-
+        
+        // Broadcast Update
         io.emit('auction_state', auctionState);
     });
 
-    // 3. SELL PLAYER (COMMITS TO DB)
+    // C. SELL PLAYER (Commit to DB)
     socket.on('sell_player', async () => {
         const { currentPlayerId, leadingTeamId, currentBid } = auctionState;
 
         if (currentPlayerId && leadingTeamId) {
-            // Update UI State immediately so users see "SOLD" instantly
+            // 1. Update RAM immediately for instant UI feedback
             auctionState.status = 'SOLD';
             io.emit('auction_state', auctionState);
 
             try {
-                // Perform DB writes in parallel for speed
+                // 2. Perform heavy DB writes asynchronously
+                // Parallel execution for speed
                 const updatePlayer = Player.findByIdAndUpdate(currentPlayerId, {
                     isSold: true,
                     isUnsold: false,
@@ -161,23 +172,22 @@ io.on('connection', (socket) => {
                 });
 
                 const updateTeam = Team.findByIdAndUpdate(leadingTeamId, {
-                    $inc: { spent: currentBid }, // Atomic increment is safer/faster
-                    $push: { players: currentPlayerId }
+                    $inc: { spent: currentBid }, // Atomic increment (Safe & Fast)
+                    $push: { players: currentPlayerId } // Atomic push
                 });
 
                 await Promise.all([updatePlayer, updateTeam]);
 
-                // Only now trigger a full data refresh for clients
-                io.emit('data_update');
+                // 3. Trigger Data Refresh only after DB is secure
+                io.emit('data_update'); 
 
             } catch (err) {
                 console.error("Sale Error:", err);
-                // Optional: Emit error state to admins
             }
         }
     });
 
-    // 4. UNSELL PLAYER
+    // D. UNSELL PLAYER (Pass)
     socket.on('unsell_player', async () => {
         const { currentPlayerId } = auctionState;
         if (currentPlayerId) {
@@ -187,7 +197,7 @@ io.on('connection', (socket) => {
             try {
                 await Player.findByIdAndUpdate(currentPlayerId, {
                     isSold: false,
-                    isUnsold: true
+                    isUnsold: true // Mark as unsold in DB
                 });
                 io.emit('data_update');
             } catch (err) {
@@ -196,7 +206,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 5. RESET ROUND
+    // E. RESET ROUND (Clear Screen)
     socket.on('reset_round', () => {
         auctionState = {
             currentBid: 0,
@@ -208,5 +218,6 @@ io.on('connection', (socket) => {
     });
 });
 
+// --- SERVER START ---
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
