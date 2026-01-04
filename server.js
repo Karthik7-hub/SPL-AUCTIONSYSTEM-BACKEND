@@ -134,7 +134,7 @@ app.delete('/api/players/:id', async (req, res) => {
 
 app.post('/api/super-admin/login', (req, res) => {
     // CHANGE 'superadmin123' TO YOUR NEW PASSWORD BELOW
-    if (req.body.password === 'MY_NEW_SECRET_PASSWORD') {
+    if (req.body.password === 'SUPER_ADMIN_PASSWORD') {
         res.json({ success: true });
     } else {
         res.status(401).json({ success: false });
