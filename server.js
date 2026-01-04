@@ -58,11 +58,21 @@ app.get('/api/auctions', async (req, res) => {
 app.get('/api/init/:auctionId', async (req, res) => {
     try {
         const { auctionId } = req.params;
+        const auction = await Auction.findById(auctionId); // Fetch Auction Config
         const teams = await Team.find({ auctionId }).populate('players').lean();
         const players = await Player.find({ auctionId }).sort('order').lean();
         const liveState = getRoomState(auctionId);
-        res.json({ teams, players, liveState });
-    } catch (err) { res.status(500).json({ error: "Failed to load data" }); }
+
+        // Send config back to client
+        res.json({
+            teams,
+            players,
+            liveState,
+            config: { categories: auction.categories, roles: auction.roles }
+        });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to load data" });
+    }
 });
 
 // 4. Verify Admin Password
