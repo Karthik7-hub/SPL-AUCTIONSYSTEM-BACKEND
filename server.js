@@ -132,9 +132,11 @@ app.delete('/api/players/:id', async (req, res) => {
 // 1. Verify Master Password
 // server.js
 
+// server.js
+
 app.post('/api/super-admin/login', (req, res) => {
-    // CHANGE 'superadmin123' TO YOUR NEW PASSWORD BELOW
-    if (req.body.password === 'SUPER_ADMIN_PASSWORD') {
+    // Now it checks the hidden .env file
+    if (req.body.password === process.env.SUPER_ADMIN_PASSWORD) {
         res.json({ success: true });
     } else {
         res.status(401).json({ success: false });
