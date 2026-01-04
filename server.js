@@ -48,10 +48,13 @@ app.post('/api/create-auction', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. List Auctions
 app.get('/api/auctions', async (req, res) => {
-    const auctions = await Auction.find({ isActive: true });
-    res.json(auctions);
+    try {
+        const auctions = await Auction.find().sort({ date: -1 });
+        res.json(auctions);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // 3. Init Specific Auction Data
