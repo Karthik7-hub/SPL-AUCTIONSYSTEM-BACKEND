@@ -16,6 +16,10 @@ const server = http.createServer(app);
 app.use(cors());
 app.use(express.json());
 
+app.get("/", (req, res) => {
+    res.status(200).send("Server is alive 🚀");
+});
+
 // --- MULTI-AUCTION STATE MANAGEMENT ---
 const auctionRooms = new Map();
 
