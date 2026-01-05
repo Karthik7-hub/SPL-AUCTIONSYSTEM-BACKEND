@@ -3,6 +3,9 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const http = require('http');
+const compression = require('compression'); // Speed: Gzip
+const helmet = require('helmet'); // Security: Headers
+const morgan = require('morgan'); // Debugging: Logger
 const { Server } = require('socket.io');
 
 // Import Models
@@ -13,19 +16,24 @@ const Player = require('./models/Player');
 const app = express();
 const server = http.createServer(app);
 
+// --- MIDDLEWARE ---
+app.use(helmet()); // Secure HTTP headers
+app.use(compression()); // Compress all responses
+app.use(morgan('tiny')); // Log requests to console
 app.use(cors());
 app.use(express.json());
 
 app.get("/", (req, res) => {
-    res.status(200).send("Server is alive 🚀");
+    res.status(200).send("Server is alive and optimized 🚀");
 });
 
-// --- MULTI-AUCTION STATE MANAGEMENT ---
+// --- IN-MEMORY STATE MANAGEMENT ---
 const auctionRooms = new Map();
 
 const getRoomState = (auctionId) => {
-    if (!auctionRooms.has(auctionId)) {
-        auctionRooms.set(auctionId, {
+    const id = String(auctionId);
+    if (!auctionRooms.has(id)) {
+        auctionRooms.set(id, {
             currentBid: 0,
             leadingTeamId: null,
             currentPlayerId: null,
@@ -33,10 +41,10 @@ const getRoomState = (auctionId) => {
             bidHistory: []
         });
     }
-    return auctionRooms.get(auctionId);
+    return auctionRooms.get(id);
 };
 
-// --- DATABASE ---
+// --- DATABASE CONNECTION ---
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("✅ Scalable DB Connected"))
     .catch(err => console.error("❌ DB Error:", err));
@@ -52,97 +60,67 @@ app.post('/api/create-auction', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 2. Get All Auctions (Optimized)
 app.get('/api/auctions', async (req, res) => {
     try {
-        const auctions = await Auction.find().sort({ date: -1 });
+        const auctions = await Auction.find()
+            .sort({ date: -1 })
+            .select('name date accessCode isActive categories roles') // Fetch only needed fields
+            .lean(); // Return plain JS objects (Faster)
         res.json(auctions);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// 3. Init Specific Auction Data
+// 3. Update Auction (For Editing/Status Toggle)
+app.put('/api/auctions/:id', async (req, res) => {
+    try {
+        const updated = await Auction.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        res.json({ success: true, auction: updated });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 4. Init Specific Auction Data (High Performance Parallel Load)
 app.get('/api/init/:auctionId', async (req, res) => {
     try {
         const { auctionId } = req.params;
-        const auction = await Auction.findById(auctionId); // Fetch Auction Config
-        const teams = await Team.find({ auctionId }).populate('players').lean();
-        const players = await Player.find({ auctionId }).sort('order').lean();
-        const liveState = getRoomState(auctionId);
 
-        // Send config back to client
+        // Run these 3 queries at the same time instead of one-by-one
+        const [auction, teams, players] = await Promise.all([
+            Auction.findById(auctionId).select('categories roles').lean(),
+            Team.find({ auctionId }).populate('players').lean(),
+            Player.find({ auctionId }).sort('order').lean()
+        ]);
+
+        if (!auction) return res.status(404).json({ error: "Auction not found" });
+
         res.json({
             teams,
             players,
-            liveState,
+            liveState: getRoomState(auctionId),
             config: { categories: auction.categories, roles: auction.roles }
         });
     } catch (err) {
+        console.error(err);
         res.status(500).json({ error: "Failed to load data" });
     }
 });
 
-// 4. Verify Admin Password
+// 5. Host Login
 app.post('/api/verify-admin', async (req, res) => {
     try {
         const { auctionId, password } = req.body;
-        const auction = await Auction.findById(auctionId);
-        if (!auction) return res.status(404).json({ success: false });
+        const auction = await Auction.findById(auctionId).select('accessCode').lean();
 
+        if (!auction) return res.status(404).json({ success: false });
         if (auction.accessCode === password) return res.json({ success: true });
         else return res.status(401).json({ success: false });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. Add/Delete Logic (Scoped to AuctionId)
-app.post('/api/teams', async (req, res) => {
-    const team = new Team(req.body);
-    await team.save();
-    io.to(req.body.auctionId).emit('data_update');
-    res.json(team);
-});
-
-app.post('/api/players', async (req, res) => {
-    const count = await Player.countDocuments({ auctionId: req.body.auctionId });
-    const player = new Player({ ...req.body, order: count });
-    await player.save();
-    io.to(req.body.auctionId).emit('data_update');
-    res.json(player);
-});
-
-app.delete('/api/teams/:id', async (req, res) => {
-    const team = await Team.findById(req.params.id);
-    if (team) {
-        const auctionId = team.auctionId.toString();
-        await Team.findByIdAndDelete(req.params.id);
-        await Player.updateMany({ soldTo: req.params.id }, { isSold: false, soldTo: null, soldPrice: 0 });
-        io.to(auctionId).emit('data_update');
-    }
-    res.json({ message: "Deleted" });
-});
-
-app.delete('/api/players/:id', async (req, res) => {
-    const player = await Player.findById(req.params.id);
-    if (player) {
-        const auctionId = player.auctionId.toString();
-        if (player.isSold && player.soldTo) {
-            await Team.findByIdAndUpdate(player.soldTo, { $pull: { players: player._id }, $inc: { spent: -player.soldPrice } });
-        }
-        await Player.findByIdAndDelete(req.params.id);
-        io.to(auctionId).emit('data_update');
-    }
-    res.json({ message: "Deleted" });
-});
-
-// --- SUPER ADMIN ROUTES ---
-
-// 1. Verify Master Password
-// server.js
-
-// server.js
-
+// 6. Super Admin Login
 app.post('/api/super-admin/login', (req, res) => {
-    // Now it checks the hidden .env file
     if (req.body.password === process.env.SUPER_ADMIN_PASSWORD) {
         res.json({ success: true });
     } else {
@@ -150,41 +128,73 @@ app.post('/api/super-admin/login', (req, res) => {
     }
 });
 
-// 2. Delete Entire Auction (Cascade Delete)
+// 7. Add/Delete Items
+app.post('/api/teams', async (req, res) => {
+    try {
+        const team = new Team(req.body);
+        await team.save();
+        io.to(req.body.auctionId).emit('data_update');
+        res.json(team);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/players', async (req, res) => {
+    try {
+        const count = await Player.countDocuments({ auctionId: req.body.auctionId });
+        const player = new Player({ ...req.body, order: count });
+        await player.save();
+        io.to(req.body.auctionId).emit('data_update');
+        res.json(player);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/teams/:id', async (req, res) => {
+    try {
+        const team = await Team.findById(req.params.id);
+        if (team) {
+            const auctionId = team.auctionId.toString();
+            await Team.findByIdAndDelete(req.params.id);
+            // Reset players owned by this team
+            await Player.updateMany({ soldTo: req.params.id }, { isSold: false, soldTo: null, soldPrice: 0 });
+            io.to(auctionId).emit('data_update');
+        }
+        res.json({ message: "Deleted" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/players/:id', async (req, res) => {
+    try {
+        const player = await Player.findById(req.params.id);
+        if (player) {
+            const auctionId = player.auctionId.toString();
+            if (player.isSold && player.soldTo) {
+                // Refund team money
+                await Team.findByIdAndUpdate(player.soldTo, { $pull: { players: player._id }, $inc: { spent: -player.soldPrice } });
+            }
+            await Player.findByIdAndDelete(req.params.id);
+            io.to(auctionId).emit('data_update');
+        }
+        res.json({ message: "Deleted" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 8. Delete Entire Auction (Cascade & Memory Cleanup)
 app.delete('/api/auctions/:id', async (req, res) => {
     try {
         const auctionId = req.params.id;
-
-        // 1. Delete Auction
         await Auction.findByIdAndDelete(auctionId);
-
-        // 2. Delete All Linked Teams
         await Team.deleteMany({ auctionId });
-
-        // 3. Delete All Linked Players
         await Player.deleteMany({ auctionId });
 
-        res.json({ success: true, message: "Auction and all data deleted" });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+        // Clean up memory
+        if (auctionRooms.has(auctionId)) {
+            auctionRooms.delete(auctionId);
+        }
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/auctions/:id', async (req, res) => {
-    try {
-        const updates = req.body;
-        const updatedAuction = await Auction.findByIdAndUpdate(
-            req.params.id,
-            updates,
-            { new: true } // Return the updated document
-        );
-
-        res.json({ success: true, auction: updatedAuction });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-// --- SOCKET.IO ---
+// --- SOCKET.IO LOGIC ---
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket', 'polling'] });
 
 io.on('connection', (socket) => {
@@ -200,20 +210,23 @@ io.on('connection', (socket) => {
         state.leadingTeamId = null;
         state.currentPlayerId = playerId;
         state.status = 'ACTIVE';
-        state.bidHistory = []; // Reset history
+        state.bidHistory = [];
         io.to(auctionId).emit('auction_state', state);
     });
 
     socket.on('place_bid', ({ auctionId, teamId, amount }) => {
+        if (!auctionId || !teamId || typeof amount !== 'number') return;
+
         const state = getRoomState(auctionId);
 
+        // Prevent lower bids
         if (state.leadingTeamId === null) {
             if (amount < state.currentBid) return;
         } else {
             if (amount <= state.currentBid) return;
         }
 
-        // Save History
+        // Save history for Undo
         state.bidHistory.push({ bid: state.currentBid, leader: state.leadingTeamId });
 
         state.currentBid = amount;
@@ -247,6 +260,7 @@ io.on('connection', (socket) => {
             io.to(auctionId).emit('auction_state', state);
 
             try {
+                // Update DB in parallel
                 await Promise.all([
                     Player.findByIdAndUpdate(currentPlayerId, { isSold: true, soldTo: leadingTeamId, soldPrice: currentBid }),
                     Team.findByIdAndUpdate(leadingTeamId, { $inc: { spent: currentBid }, $push: { players: currentPlayerId } })
@@ -261,17 +275,16 @@ io.on('connection', (socket) => {
         if (state.currentPlayerId) {
             state.status = 'UNSOLD';
             io.to(auctionId).emit('auction_state', state);
-            await Player.findByIdAndUpdate(state.currentPlayerId, { isSold: false, isUnsold: true });
-            io.to(auctionId).emit('data_update');
+            try {
+                await Player.findByIdAndUpdate(state.currentPlayerId, { isSold: false, isUnsold: true });
+                io.to(auctionId).emit('data_update');
+            } catch (err) { console.error(err); }
         }
     });
 
     socket.on('reset_round', ({ auctionId }) => {
         const state = getRoomState(auctionId);
-        state.currentBid = 0;
-        state.leadingTeamId = null;
-        state.currentPlayerId = null;
-        state.status = 'IDLE';
+        Object.assign(state, { currentBid: 0, leadingTeamId: null, currentPlayerId: null, status: 'IDLE', bidHistory: [] });
         io.to(auctionId).emit('auction_state', state);
     });
 });

@@ -17,4 +17,6 @@ const AuctionSchema = new mongoose.Schema({
     }
 });
 
+AuctionSchema.index({ date: -1 });
+
 module.exports = mongoose.model('Auction', AuctionSchema);

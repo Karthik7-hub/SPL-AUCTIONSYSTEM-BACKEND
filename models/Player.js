@@ -13,4 +13,7 @@ const PlayerSchema = new mongoose.Schema({
     soldPrice: { type: Number, default: 0 }
 });
 
+PlayerSchema.index({ auctionId: 1 });
+PlayerSchema.index({ soldTo: 1 });
+
 module.exports = mongoose.model('Player', PlayerSchema);

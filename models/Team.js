@@ -9,4 +9,6 @@ const TeamSchema = new mongoose.Schema({
     players: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Player' }]
 });
 
+TeamSchema.index({ auctionId: 1 });
+
 module.exports = mongoose.model('Team', TeamSchema);
